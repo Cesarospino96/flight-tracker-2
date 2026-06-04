@@ -1,0 +1,217 @@
+"""
+Rastreador de precios de vuelo: BOG → BAQ
+Fecha: 9 de agosto 2026 | Vuelos después de las 18:00
+Notificaciones por WhatsApp (Twilio)
+"""
+
+import os
+import csv
+import json
+import smtplib
+from datetime import datetime
+from pathlib import Path
+
+import requests
+from twilio.rest import Client
+
+
+# ─── Configuración ──────────────────────────────────────────────────────────
+
+ORIGIN      = "BOG"
+DESTINATION = "BAQ"
+DATE        = "2026-08-09"
+MIN_HOUR    = 18          # Solo vuelos desde las 18:00
+MAX_PRICE   = 150_000     # COP — umbral de alerta
+CURRENCY    = "COP"
+HISTORY_FILE = "price_history.csv"
+
+# Credenciales leídas desde variables de entorno (GitHub Secrets)
+SERPAPI_KEY      = os.environ["SERPAPI_KEY"]
+TWILIO_SID       = os.environ["TWILIO_ACCOUNT_SID"]
+TWILIO_TOKEN     = os.environ["TWILIO_AUTH_TOKEN"]
+TWILIO_FROM      = os.environ["TWILIO_WHATSAPP_FROM"]   # ej: whatsapp:+14155238886
+TWILIO_TO        = os.environ["TWILIO_WHATSAPP_TO"]     # ej: whatsapp:+573001234567
+
+
+# ─── Consulta de vuelos via SerpAPI (Google Flights) ─────────────────────────
+
+def fetch_flights():
+    """Consulta vuelos BOG→BAQ para la fecha dada vía Google Flights (SerpAPI)."""
+    url = "https://serpapi.com/search"
+    params = {
+        "engine":          "google_flights",
+        "departure_id":    ORIGIN,
+        "arrival_id":      DESTINATION,
+        "outbound_date":   DATE,
+        "currency":        CURRENCY,
+        "hl":              "es",
+        "type":            "2",          # Solo ida
+        "api_key":         SERPAPI_KEY,
+    }
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def parse_flights(data):
+    """
+    Extrae vuelos con salida >= MIN_HOUR y devuelve lista de dicts:
+      { airline, departure_time, arrival_time, duration, price, link }
+    """
+    flights = []
+
+    # SerpAPI devuelve best_flights y other_flights
+    for section in ("best_flights", "other_flights"):
+        for item in data.get(section, []):
+            for leg in item.get("flights", []):
+                dep_str = leg.get("departure_airport", {}).get("time", "")  # "2026-08-09 18:30"
+                try:
+                    dep_dt = datetime.strptime(dep_str, "%Y-%m-%d %H:%M")
+                except ValueError:
+                    continue
+
+                if dep_dt.hour < MIN_HOUR:
+                    continue
+
+                price = item.get("price")
+                if not price:
+                    continue
+
+                flights.append({
+                    "airline":        leg.get("airline", "Desconocida"),
+                    "departure_time": dep_dt.strftime("%H:%M"),
+                    "arrival_time":   leg.get("arrival_airport", {}).get("time", "")[-5:],
+                    "duration":       item.get("total_duration", ""),
+                    "price":          int(price),
+                    "link":           data.get("search_metadata", {}).get("google_flights_url", "https://www.google.com/travel/flights"),
+                })
+
+    # Ordenar por precio ascendente
+    flights.sort(key=lambda f: f["price"])
+    return flights
+
+
+# ─── Historial de precios ────────────────────────────────────────────────────
+
+def load_history():
+    history = []
+    if Path(HISTORY_FILE).exists():
+        with open(HISTORY_FILE, newline="", encoding="utf-8") as f:
+            history = list(csv.DictReader(f))
+    return history
+
+
+def save_history(flights):
+    """Agrega los precios encontrados al CSV histórico."""
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    file_exists = Path(HISTORY_FILE).exists()
+
+    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
+        fieldnames = ["timestamp", "airline", "departure_time", "price"]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for fl in flights:
+            writer.writerow({
+                "timestamp":      now,
+                "airline":        fl["airline"],
+                "departure_time": fl["departure_time"],
+                "price":          fl["price"],
+            })
+
+
+def get_previous_minimum():
+    """Devuelve el precio mínimo registrado en corridas anteriores."""
+    history = load_history()
+    if not history:
+        return None
+    prices = [int(r["price"]) for r in history if r.get("price", "").isdigit()]
+    return min(prices) if prices else None
+
+
+# ─── Notificación WhatsApp (Twilio) ─────────────────────────────────────────
+
+def send_whatsapp(message: str):
+    client = Client(TWILIO_SID, TWILIO_TOKEN)
+    msg = client.messages.create(
+        body=message,
+        from_=TWILIO_FROM,
+        to=TWILIO_TO,
+    )
+    print(f"[WhatsApp] Mensaje enviado: SID={msg.sid}")
+
+
+def build_alert_message(flights, is_new_low=False):
+    cheapest = flights[0]
+    price_fmt = f"${cheapest['price']:,.0f}".replace(",", ".")
+
+    icon = "🔥" if cheapest["price"] <= MAX_PRICE else "✈️"
+    header = f"{icon} *Alerta de vuelo: BOG → BAQ*\n📅 9 de agosto 2026\n\n"
+
+    if is_new_low:
+        header = f"🚨 *¡MÍNIMO HISTÓRICO!* BOG → BAQ\n📅 9 de agosto 2026\n\n"
+
+    body = (
+        f"*Precio más bajo encontrado:*\n"
+        f"  💰 {price_fmt} COP\n"
+        f"  🛫 {cheapest['airline']} | Sale: {cheapest['departure_time']} | Llega: {cheapest['arrival_time']}\n"
+        f"  ⏱ Duración: {cheapest['duration']} min\n\n"
+    )
+
+    if len(flights) > 1:
+        body += "*Otras opciones después de las 6PM:*\n"
+        for fl in flights[1:4]:
+            p = f"${fl['price']:,.0f}".replace(",", ".")
+            body += f"  • {fl['airline']} {fl['departure_time']} → {fl['arrival_time']} | {p} COP\n"
+        body += "\n"
+
+    footer = f"🔗 {cheapest['link']}\n_Revisado: {datetime.utcnow().strftime('%d/%m/%Y %H:%M')} UTC_"
+    return header + body + footer
+
+
+# ─── Lógica principal ────────────────────────────────────────────────────────
+
+def main():
+    print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}] Buscando vuelos {ORIGIN} → {DESTINATION} el {DATE}...")
+
+    try:
+        data = fetch_flights()
+    except Exception as e:
+        print(f"[ERROR] No se pudo consultar SerpAPI: {e}")
+        raise
+
+    flights = parse_flights(data)
+
+    if not flights:
+        print("No se encontraron vuelos después de las 18:00.")
+        return
+
+    cheapest_price = flights[0]["price"]
+    prev_min = get_previous_minimum()
+    print(f"Precio más bajo encontrado: ${cheapest_price:,} COP | Mínimo previo: {prev_min}")
+
+    save_history(flights)
+
+    should_alert = False
+    is_new_low   = False
+
+    # Alerta si está bajo el umbral deseado
+    if cheapest_price <= MAX_PRICE:
+        should_alert = True
+        print(f"✅ Precio bajo el umbral de ${MAX_PRICE:,} COP — enviando alerta.")
+
+    # Alerta si es un nuevo mínimo histórico
+    if prev_min and cheapest_price < prev_min:
+        should_alert = True
+        is_new_low   = True
+        print(f"🔥 Nuevo mínimo histórico: ${cheapest_price:,} < ${prev_min:,} COP")
+
+    if should_alert:
+        msg = build_alert_message(flights, is_new_low=is_new_low)
+        send_whatsapp(msg)
+    else:
+        print(f"Precio actual ${cheapest_price:,} COP está sobre el umbral. Sin alerta.")
+
+
+if __name__ == "__main__":
+    main()
